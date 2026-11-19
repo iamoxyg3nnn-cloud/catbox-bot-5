@@ -448,3 +448,5 @@ jobs:
               Invoke-RestMethod -Method Post -Uri $env:ALERT_WEBHOOK_URL -ContentType 'application/json' -Body $payload | Out-Null
             } catch { Write-Warning 'Discord alert failed.' }
           }
+
+# Re-indexed after repository migration to iamoxyg3nnn-cloud.
