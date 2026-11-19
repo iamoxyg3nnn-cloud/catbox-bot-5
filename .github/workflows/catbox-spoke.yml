@@ -1,0 +1,450 @@
+name: Catbox Spoke bot-5
+
+# One Discord bot per repository. This spoke runs with NODE_MODE=node, holds a
+# single bot token, and exposes itself to the hub through a per-session
+# Cloudflare quick tunnel. It does NOT run the admin console, job runner,
+# metadata mirror or expiry purge (all single-writer). Each run queues its own
+# successor so the spoke stays online by chaining, never by a cron trigger.
+#
+# Like the hub, this runs on a windows-latest GitHub-hosted runner. Its D:
+# drive (~150 GiB) is transient staging (D:\catbox_staging) for the life of the
+# run; Tailscale + RDP expose the session to the operator. Neither supplies
+# durable storage: Discord is the only byte store and a staged body is deleted
+# only after Discord confirms the attachment.
+
+on:
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: 'session-chain:<n> (automatic) | blank if manual'
+        required: false
+        default: ''
+
+concurrency:
+  group: catbox-spoke-session
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  spoke:
+    name: catbox-spoke-bot-5
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Queue the next session (early insurance)
+        if: always()
+        shell: pwsh
+        env:
+          TRIGGERED_BY: ${{ inputs.triggered_by }}
+          CHAIN_REF: ${{ github.event.repository.default_branch || github.ref_name }}
+        run: |
+          $n = 0
+          if ($env:TRIGGERED_BY -match '^session-chain:(\d{1,9})$') { $n = [int]$Matches[1] }
+          $maxRetries = 5
+          if (($n + 1) -gt $maxRetries) {
+            Write-Host "Retry budget spent ($n/$maxRetries) - not queueing."
+            exit 0
+          }
+          $body = @{
+            ref = $env:CHAIN_REF
+            inputs = @{ triggered_by = "session-chain:$($n + 1)" }
+          } | ConvertTo-Json -Compress -Depth 5
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/catbox-spoke.yml/dispatches"
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          foreach ($attempt in 1..3) {
+            try {
+              Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
+              Write-Host "Successor queued (retry $($n + 1)/$maxRetries)."
+              exit 0
+            } catch {
+              Write-Warning "Dispatch attempt $attempt failed: $($_.Exception.Message)"
+              if ($attempt -lt 3) { Start-Sleep -Seconds 15 }
+            }
+          }
+          Write-Error 'Could not queue the next session from the insurance step.'
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: 'Prepare local D: staging'
+        shell: pwsh
+        run: |
+          # Transient bytes only, deleted once Discord confirms the attachment.
+          New-Item -ItemType Directory -Force -Path 'D:\catbox_staging' | Out-Null
+          Write-Host "Spoke staging ready: D:\catbox_staging"
+          Write-Host ("(DISK) C: free=" + [math]::Round((Get-PSDrive C).Free/1GB,1) + "GB  D: free=" + [math]::Round((Get-PSDrive D).Free/1GB,1) + "GB")
+
+      - name: Enable Tailscale RDP access
+        if: env.TAILSCALE_AUTH_KEY != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # GitHub-hosted runners inject proxy variables that hijack
+          # tailscaled's control-plane TLS handshake ("Tailscale is starting").
+          foreach ($v in 'ALL_PROXY','all_proxy','HTTP_PROXY','HTTPS_PROXY','http_proxy','https_proxy') {
+            Remove-Item "Env:$v" -ErrorAction SilentlyContinue
+          }
+
+          try {
+            $msi = "$env:RUNNER_TEMP\tailscale-setup.msi"
+            if (-not (Test-Path $msi)) {
+              Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+                -OutFile $msi -UseBasicParsing -TimeoutSec 120
+            }
+            $rc = (Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/quiet', '/norestart') -Wait -PassThru).ExitCode
+            if ($rc -ne 0) { throw "Tailscale MSI install exited $rc" }
+
+            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+            if (-not (Test-Path $ts)) { throw "tailscale.exe not found after install" }
+
+            Set-Service -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name TermService -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName 'Catbox operator RDP' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+
+            $rdpUser = 'catbox-rdp'
+            $password = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 20 | ForEach-Object { [char]$_ })
+            & net user $rdpUser $password /add /y 2>&1 | Out-Null
+            & net localgroup administrators $rdpUser /add /y 2>&1 | Out-Null
+
+            $hostname = "catbox-spoke-bot-5-$env:GITHUB_RUN_ID"
+            $upArgs = @('up', "--authkey=$env:TAILSCALE_AUTH_KEY", "--hostname=$hostname", '--accept-dns=false', '--timeout=120s', '--reset')
+            & $ts @upArgs 2>&1 | ForEach-Object { Write-Host "tailscale: $_" }
+
+            $ip = ''
+            for ($i = 0; $i -lt 18; $i++) {
+              $ip = (& $ts ip -4 2>$null | Out-String).Trim()
+              if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
+              Start-Sleep -Seconds 5
+            }
+
+            if ($ip -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+              # Some runners cannot bring up the WinTun adapter. Retry with the
+              # userspace daemon, as the reference fleet does.
+              Write-Warning 'Tailscale WinTun did not come up; retrying with userspace networking.'
+              Stop-Service -Name Tailscale -Force -ErrorAction SilentlyContinue
+              Get-Process tailscaled -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 3
+              $stateDir = "$env:TEMP\CatboxTailscaleUserspace"
+              New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+              $stateFile = Join-Path $stateDir 'server-state.conf'
+              $tsd = "$env:ProgramFiles\Tailscale\tailscaled.exe"
+              Start-Process -FilePath $tsd -ArgumentList @("--state=`"$stateFile`"", '--tun=userspace-networking') -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+              Start-Sleep -Seconds 20
+              & $ts @upArgs 2>&1 | ForEach-Object { Write-Host "tailscale(userspace): $_" }
+              for ($i = 0; $i -lt 24; $i++) {
+                $ip = (& $ts ip -4 2>$null | Out-String).Trim()
+                if ($ip -match '^\d+\.\d+\.\d+\.\d+$') { break }
+                Start-Sleep -Seconds 5
+              }
+            }
+
+            if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
+              "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+              Write-Host "======================================="
+              Write-Host "  CATBOX SPOKE bot-5 RDP (this session only)"
+              Write-Host "  mstsc /v:$ip"
+              Write-Host "  user: $rdpUser"
+              Write-Host "  pass: $password"
+              Write-Host "======================================="
+            } else {
+              # RDP is an operator convenience, not a dependency of the bot.
+              Write-Warning 'Tailscale did not obtain an IPv4 address - RDP disabled, spoke will still start.'
+            }
+          } catch {
+            Write-Warning "Tailscale/RDP setup failed: $($_.Exception.Message) - spoke will still start."
+          }
+
+      - name: Tailscale RDP not configured
+        if: env.TAILSCALE_AUTH_KEY == ''
+        shell: pwsh
+        run: Write-Warning 'TAILSCALE_AUTH_KEY is not set - RDP access is disabled. Add the secret to enable it.'
+
+      - name: Write runtime configuration
+        shell: pwsh
+        env:
+          PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+          CONTROL_PLANE_URL: ${{ secrets.CONTROL_PLANE_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NODE_UPLOAD_SECRET: ${{ secrets.NODE_UPLOAD_SECRET }}
+        run: |
+          # This spoke owns exactly one bot. PUBLIC_BASE_URL is the HUB origin so
+          # generated file links point at the public API, not this tunnel.
+          # Node ids are bot-N (hub registry), but the Discord id must match the
+          # hub's bot ids so the hub can resolve files uploaded by this spoke.
+          $bots = @(@{ id = 'bot5'; token = $env:DISCORD_BOT_TOKEN; channelId = $env:DISCORD_CHANNEL_ID })
+          $botsJson = ConvertTo-Json -InputObject $bots -Compress -Depth 5
+
+          @"
+          PORT=3000
+          PUBLIC_BASE_URL=$env:PUBLIC_BASE_URL
+          CONTROL_PLANE_URL=$env:CONTROL_PLANE_URL
+          NODE_MODE=node
+          NODE_ID=bot-5
+          TRUST_PROXY=1
+          DATA_DIR=./data
+          STAGING_DIR=D:\catbox_staging
+          MAX_FILE_SIZE=20mb
+          FILE_DELIVERY=proxy
+          DISCORD_BOT_ID=bot5
+          DISCORD_BOTS=$botsJson
+          DISCORD_CHANNEL_ID=$env:DISCORD_CHANNEL_ID
+          SUPABASE_URL=$env:SUPABASE_URL
+          SUPABASE_SERVICE_ROLE_KEY=$env:SUPABASE_SERVICE_ROLE_KEY
+          NODE_UPLOAD_SECRET=$env:NODE_UPLOAD_SECRET
+          "@ | Set-Content -Path .env -Encoding utf8
+
+          "DISCORD_BOTS=$botsJson" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host 'Runtime configuration written for one Discord bot (token masked in logs).'
+
+      - name: Require durable metadata config
+        shell: pwsh
+        env:
+          PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+          CONTROL_PLANE_URL: ${{ secrets.CONTROL_PLANE_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NODE_UPLOAD_SECRET: ${{ secrets.NODE_UPLOAD_SECRET }}
+        run: |
+          $missing = @()
+          foreach ($name in 'PUBLIC_BASE_URL','CONTROL_PLANE_URL','DISCORD_BOT_TOKEN','DISCORD_CHANNEL_ID','SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY','NODE_UPLOAD_SECRET') {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              Write-Error "::error::$name is empty - refusing to start on an ephemeral runner"
+              $missing += $name
+            }
+          }
+          if ($missing.Count -gt 0) { exit 1 }
+          Write-Host 'Durable metadata configuration present.'
+
+      - name: Install cloudflared
+        shell: pwsh
+        run: |
+          $dest = "$env:RUNNER_TEMP\cloudflared.exe"
+          Invoke-WebRequest -Uri 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' `
+            -OutFile $dest -UseBasicParsing -TimeoutSec 180
+          & $dest --version
+
+      - name: Start spoke and keep alive
+        shell: pwsh
+        env:
+          PUBLIC_BASE_URL: ${{ secrets.PUBLIC_BASE_URL }}
+          CONTROL_PLANE_URL: ${{ secrets.CONTROL_PLANE_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          NODE_UPLOAD_SECRET: ${{ secrets.NODE_UPLOAD_SECRET }}
+          UPLOAD_MAX_PER_MIN: ${{ vars.UPLOAD_MAX_PER_MIN || '40' }}
+          DISCORD_REQUEST_CONCURRENCY: ${{ vars.DISCORD_REQUEST_CONCURRENCY || '8' }}
+          DISCORD_MAX_CONCURRENCY: ${{ vars.DISCORD_MAX_CONCURRENCY || '16' }}
+        run: |
+          # The app reads process.env directly (no dotenv loader). Set the
+          # non-secret values here; secrets arrive via this step's env block.
+          $env:PORT = '3000'
+          $env:NODE_MODE = 'node'
+          $env:NODE_ID = 'bot-5'
+          $env:STAGING_DIR = 'D:\catbox_staging'
+          $env:DATA_DIR = '.\data'
+          $env:FILE_DELIVERY = 'proxy'
+          $env:DISCORD_BOT_ID = 'bot5'
+          $env:MAX_FILE_SIZE = '20mb'
+          $env:TRUST_PROXY = '1'
+
+          $tunnelLog = "$env:RUNNER_TEMP\tunnel.log"
+          $tunnelErr = "$env:RUNNER_TEMP\tunnel.err"
+          $serverLog = "$env:RUNNER_TEMP\server.log"
+          $serverErr = "$env:RUNNER_TEMP\server.err"
+          Set-Content -Path $tunnelLog -Value ''
+          Set-Content -Path $tunnelErr -Value ''
+          Set-Content -Path $serverLog -Value ''
+          Set-Content -Path $serverErr -Value ''
+
+          $cloudflared = "$env:RUNNER_TEMP\cloudflared.exe"
+
+          # A quick tunnel needs no named-tunnel token; its URL is random and
+          # valid only for this session, so the hub learns it via heartbeat.
+          $tunnelProc = Start-Process -FilePath $cloudflared `
+            -ArgumentList @('tunnel', '--no-autoupdate', '--url', 'http://localhost:3000') `
+            -PassThru -RedirectStandardOutput $tunnelLog -RedirectStandardError $tunnelErr
+
+          $url = ''
+          foreach ($i in 1..60) {
+            if ($tunnelProc.HasExited) {
+              Write-Error '::error::cloudflared exited before publishing a URL'
+              Get-Content $tunnelLog, $tunnelErr -Tail 80 -ErrorAction SilentlyContinue
+              exit 1
+            }
+            $text = ((Get-Content $tunnelLog, $tunnelErr -Raw -ErrorAction SilentlyContinue) -join "`n")
+            $match = [regex]::Match($text, 'https://[a-z0-9][a-z0-9-]*\.trycloudflare\.com')
+            if ($match.Success) { $url = $match.Value; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $url) {
+            Write-Error '::error::No quick tunnel URL appeared within 120s'
+            Get-Content $tunnelLog, $tunnelErr -Tail 80 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          $env:NODE_PUBLIC_URL = $url
+
+          $nodeExe = (Get-Command node).Source
+          $serverProc = Start-Process -FilePath $nodeExe -ArgumentList 'server.js' `
+            -WorkingDirectory $env:GITHUB_WORKSPACE -PassThru `
+            -RedirectStandardOutput $serverLog -RedirectStandardError $serverErr
+
+          try {
+            # Readiness: local app AND registration in the hub's node registry.
+            $ready = $false
+            $deadline = (Get-Date).AddSeconds(180)
+            while ((Get-Date) -lt $deadline) {
+              if ($serverProc.HasExited) {
+                Write-Error '::error::Spoke exited before becoming ready'
+                Get-Content $serverLog, $serverErr -Tail 100 -ErrorAction SilentlyContinue
+                exit 1
+              }
+              if ($tunnelProc.HasExited) {
+                Write-Error '::error::cloudflared exited before becoming ready'
+                Get-Content $tunnelLog, $tunnelErr -Tail 100 -ErrorAction SilentlyContinue
+                exit 1
+              }
+              try {
+                $local = Invoke-WebRequest -Uri 'http://localhost:3000/api/config' -UseBasicParsing -TimeoutSec 5 -SkipHttpErrorCheck
+                if ([int]$local.StatusCode -eq 200) {
+                  $nodes = Invoke-RestMethod -Uri "$env:CONTROL_PLANE_URL/api/nodes" -TimeoutSec 10
+                  $list = if ($nodes -and $nodes.nodes) { $nodes.nodes } else { @($nodes) }
+                  $found = @($list | Where-Object { $_.id -eq 'bot-5' -and $_.status -eq 'up' })
+                  if ($found.Count -gt 0) { $ready = $true; break }
+                }
+              } catch { } # Not ready yet.
+              Start-Sleep -Seconds 5
+            }
+            if (-not $ready) {
+              Write-Error '::error::Spoke did not register with the hub within 180s'
+              Get-Content $serverLog, $serverErr -Tail 100 -ErrorAction SilentlyContinue
+              Get-Content $tunnelLog, $tunnelErr -Tail 100 -ErrorAction SilentlyContinue
+              exit 1
+            }
+
+            Write-Host '======================================='
+            Write-Host "       CATBOX SPOKE bot-5 READY"
+            Write-Host '======================================='
+            Write-Host "  Session : #$env:GITHUB_RUN_NUMBER"
+            Write-Host "  Tunnel  : $url"
+            Write-Host '======================================='
+
+            # Hold the session open. 330 min, below the 360 min job cap so a
+            # healthy run always reaches SESSION_COMPLETE.
+            $end = (Get-Date).AddMinutes(330)
+            $serverLines = 0
+            $tunnelLines = 0
+            while ((Get-Date) -lt $end) {
+              if ($serverProc.HasExited) {
+                Write-Error "::error::Spoke exited unexpectedly (exit code $($serverProc.ExitCode))"
+                Get-Content $serverLog, $serverErr -Tail 200 -ErrorAction SilentlyContinue
+                exit 1
+              }
+              if ($tunnelProc.HasExited) {
+                Write-Error "::error::cloudflared exited unexpectedly (exit code $($tunnelProc.ExitCode))"
+                Get-Content $tunnelLog, $tunnelErr -Tail 200 -ErrorAction SilentlyContinue
+                exit 1
+              }
+              $all = @(Get-Content $serverLog -ErrorAction SilentlyContinue)
+              if ($all.Count -gt $serverLines) {
+                $all[$serverLines..($all.Count - 1)] | ForEach-Object { Write-Host $_ }
+                $serverLines = $all.Count
+              }
+              $all = @(Get-Content $tunnelLog -ErrorAction SilentlyContinue)
+              if ($all.Count -gt $tunnelLines) {
+                $all[$tunnelLines..($all.Count - 1)] | ForEach-Object { Write-Host $_ }
+                $tunnelLines = $all.Count
+              }
+              $code = 0
+              try {
+                $probe = Invoke-WebRequest -Uri 'http://localhost:3000/api/config' -UseBasicParsing -TimeoutSec 10 -SkipHttpErrorCheck
+                $code = [int]$probe.StatusCode
+              } catch { }
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Spoke bot-5 alive (PID $($serverProc.Id)) - HTTP $code"
+              Start-Sleep -Seconds 30
+            }
+            'SESSION_COMPLETE=true' | Out-File -FilePath $env:GITHUB_ENV -Append
+          } finally {
+            Stop-Process -Id $tunnelProc.Id -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $serverProc.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Queue the next session (session end)
+        if: always()
+        shell: pwsh
+        env:
+          TRIGGERED_BY: ${{ inputs.triggered_by }}
+          CHAIN_REF: ${{ github.event.repository.default_branch || github.ref_name }}
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+        run: |
+          $n = 0
+          if ($env:TRIGGERED_BY -match '^session-chain:(\d{1,9})$') { $n = [int]$Matches[1] }
+          $maxRetries = 5
+          $next = $n + 1
+          if ($env:SESSION_COMPLETE -eq 'true') { $next = 0 }
+          $stopReason = ''
+          if ($next -gt $maxRetries) {
+            $stopReason = "$n sessions in a row ended early or never started"
+          } else {
+            $body = @{
+              ref = $env:CHAIN_REF
+              inputs = @{ triggered_by = "session-chain:$next" }
+            } | ConvertTo-Json -Compress -Depth 5
+            $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/catbox-spoke.yml/dispatches"
+            $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+            }
+            $queued = $false
+            foreach ($attempt in 1..3) {
+              try {
+                Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
+                $queued = $true
+                break
+              } catch {
+                Write-Warning "Dispatch attempt $attempt failed: $($_.Exception.Message)"
+                if ($attempt -lt 3) { Start-Sleep -Seconds 15 }
+              }
+            }
+            if ($queued) {
+              Write-Host "Successor queued (retry $next/$maxRetries)."
+              exit 0
+            }
+            $stopReason = 'GitHub refused the dispatch (see warnings above)'
+          }
+          Write-Error "::error::Spoke session chain stopped: $stopReason"
+          if (-not [string]::IsNullOrWhiteSpace($env:ALERT_WEBHOOK_URL)) {
+            $content = ":warning: **catbox-bot-bot-5** spoke chain stopped: $stopReason"
+            $payload = @{ content = $content } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Method Post -Uri $env:ALERT_WEBHOOK_URL -ContentType 'application/json' -Body $payload | Out-Null
+            } catch { Write-Warning 'Discord alert failed.' }
+          }
