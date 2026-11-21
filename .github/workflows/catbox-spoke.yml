@@ -437,7 +437,7 @@ jobs:
           }
           Write-Error "::error::Could not queue next spoke session from end step after retries; insurance successor may still keep the chain alive."
           if (-not [string]::IsNullOrWhiteSpace($env:ALERT_WEBHOOK_URL)) {
-            $content = ":warning: **catbox-bot-bot-5** spoke chain stopped: $stopReason"
+            $content = ":warning: **catbox-bot-bot-5** spoke end-step dispatch failed after retries (auto-retry attempt $next)."
             $payload = @{ content = $content } | ConvertTo-Json -Compress
             try {
               Invoke-RestMethod -Method Post -Uri $env:ALERT_WEBHOOK_URL -ContentType 'application/json' -Body $payload | Out-Null
