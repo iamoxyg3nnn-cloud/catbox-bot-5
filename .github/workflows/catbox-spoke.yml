@@ -50,14 +50,10 @@ jobs:
         run: |
           $n = 0
           if ($env:TRIGGERED_BY -match '^session-chain:(\d{1,9})$') { $n = [int]$Matches[1] }
-          $maxRetries = 5
-          if (($n + 1) -gt $maxRetries) {
-            Write-Host "Retry budget spent ($n/$maxRetries) - not queueing."
-            exit 0
-          }
+          $next = $n + 1
           $body = @{
             ref = $env:CHAIN_REF
-            inputs = @{ triggered_by = "session-chain:$($n + 1)" }
+            inputs = @{ triggered_by = "session-chain:$next" }
           } | ConvertTo-Json -Compress -Depth 5
           $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/catbox-spoke.yml/dispatches"
           $headers = @{
@@ -68,7 +64,7 @@ jobs:
           foreach ($attempt in 1..3) {
             try {
               Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
-              Write-Host "Successor queued (retry $($n + 1)/$maxRetries)."
+              Write-Host "Successor queued (attempt $next)."
               exit 0
             } catch {
               Write-Warning "Dispatch attempt $attempt failed: $($_.Exception.Message)"
@@ -406,41 +402,40 @@ jobs:
         run: |
           $n = 0
           if ($env:TRIGGERED_BY -match '^session-chain:(\d{1,9})$') { $n = [int]$Matches[1] }
-          $maxRetries = 5
           $next = $n + 1
           if ($env:SESSION_COMPLETE -eq 'true') { $next = 0 }
-          $stopReason = ''
-          if ($next -gt $maxRetries) {
-            $stopReason = "$n sessions in a row ended early or never started"
-          } else {
-            $body = @{
-              ref = $env:CHAIN_REF
-              inputs = @{ triggered_by = "session-chain:$next" }
-            } | ConvertTo-Json -Compress -Depth 5
-            $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/catbox-spoke.yml/dispatches"
-            $headers = @{
-              Authorization = "Bearer $env:GH_TOKEN"
-              Accept = 'application/vnd.github+json'
-              'X-GitHub-Api-Version' = '2022-11-28'
-            }
-            $queued = $false
-            foreach ($attempt in 1..3) {
-              try {
-                Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
-                $queued = $true
-                break
-              } catch {
-                Write-Warning "Dispatch attempt $attempt failed: $($_.Exception.Message)"
-                if ($attempt -lt 3) { Start-Sleep -Seconds 15 }
-              }
-            }
-            if ($queued) {
-              Write-Host "Successor queued (retry $next/$maxRetries)."
-              exit 0
-            }
-            $stopReason = 'GitHub refused the dispatch (see warnings above)'
+
+          if ($next -gt 5) {
+            Write-Warning "::warning::$n consecutive unhealthy spoke sessions; continuing to auto-retry."
           }
-          Write-Error "::error::Spoke session chain stopped: $stopReason"
+
+          $body = @{
+            ref = $env:CHAIN_REF
+            inputs = @{ triggered_by = "session-chain:$next" }
+          } | ConvertTo-Json -Compress -Depth 5
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/catbox-spoke.yml/dispatches"
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          }
+          $queued = $false
+          foreach ($attempt in 1..3) {
+            try {
+              Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
+              $queued = $true
+              break
+            } catch {
+              Write-Warning "Dispatch attempt $attempt failed: $($_.Exception.Message)"
+              if ($attempt -lt 3) { Start-Sleep -Seconds 15 }
+            }
+          }
+          if ($queued) {
+            if ($next -eq 0) { Write-Host "Healthy session complete; successor queued (counter reset)." }
+            else { Write-Host "Successor queued (auto-retry attempt $next)." }
+            exit 0
+          }
+          Write-Error "::error::Could not queue next spoke session from end step after retries; insurance successor may still keep the chain alive."
           if (-not [string]::IsNullOrWhiteSpace($env:ALERT_WEBHOOK_URL)) {
             $content = ":warning: **catbox-bot-bot-5** spoke chain stopped: $stopReason"
             $payload = @{ content = $content } | ConvertTo-Json -Compress
